@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-selfcheck.json
+pip-log.txt
+
+# VS Code
+.vscode/
+
+# Dummy files
+dummy_*.png
+dummy_*.csv
+dummy_*.npy
+temp_gradio_image.png
+
+# Data files - these are too large for a git repo
+# It's better to have a script to download them or provide a link in the README
+/clinical_lab_data/healthcare-dataset-stroke-data.csv
+/MRI_DATA/
+/eeg_stroke_patients/
+
+# Model files - these are binary files and can be large
+# It's better to host them elsewhere and download them
+/models/*.pth
+/models/*.joblib

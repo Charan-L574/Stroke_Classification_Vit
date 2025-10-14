@@ -1,0 +1,11 @@
+torch
+torchvision
+pandas
+scikit-learn
+imblearn
+joblib
+Pillow
+gradio
+matplotlib
+timm
+opencv-python
