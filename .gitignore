@@ -9,6 +9,9 @@ venv/
 pip-selfcheck.json
 pip-log.txt
 
+# Unused files
+unused_files/
+
 # VS Code
 .vscode/
 

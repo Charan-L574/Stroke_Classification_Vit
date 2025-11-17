@@ -1,6 +1,46 @@
 import torch
 import torch.nn as nn
 
+class SimpleEEGModel(nn.Module):
+    """Simple 1D CNN for EEG signal classification (used for enhanced training)"""
+    def __init__(self, num_classes=5, input_length=256):
+        super(SimpleEEGModel, self).__init__()
+        
+        # Feature extraction layers
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=16, kernel_size=5, padding=2)
+        self.bn1 = nn.BatchNorm1d(16)
+        self.pool1 = nn.MaxPool1d(2)
+        
+        self.conv2 = nn.Conv1d(in_channels=16, out_channels=32, kernel_size=5, padding=2)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.pool2 = nn.MaxPool1d(2)
+        
+        # Calculate flattened size
+        # After conv1 + pool1: 256 -> 128
+        # After conv2 + pool2: 128 -> 64
+        flattened_size = 32 * (input_length // 4)
+        
+        # Classification layers
+        self.fc1 = nn.Linear(flattened_size, 128)
+        self.dropout = nn.Dropout(0.5)
+        self.fc2 = nn.Linear(128, num_classes)
+        
+    def forward(self, x):
+        # Convolutional layers
+        x = self.pool1(torch.relu(self.bn1(self.conv1(x))))
+        x = self.pool2(torch.relu(self.bn2(self.conv2(x))))
+        
+        # Flatten
+        x = x.view(x.size(0), -1)
+        
+        # Fully connected layers
+        x = torch.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        
+        return x
+
+
 class EEGModel(nn.Module):
     def __init__(self, num_channels, num_freq_bins, cnn_out_channels=64, cnn_kernel_size=5, pool_size=2, lstm_hidden_size=128, num_lstm_layers=2, feature_vector_size=64):
         """
