@@ -394,15 +394,42 @@ The visualization on the left shows a **heatmap overlay** on your brain scan:
 # EEG Post-Stroke Analysis
 # ===========================
 
-def analyze_eeg_signal(eeg_signal_text):
-    """Analyze EEG signal for post-stroke monitoring"""
+def analyze_eeg_signal(eeg_signal_text, eeg_csv_file=None):
+    """
+    Analyze EEG signal for post-stroke monitoring.
     
+    Args:
+        eeg_signal_text: String of comma-separated EEG values (256 samples)
+        eeg_csv_file: Optional CSV file with EEG data
+        
+    Returns:
+        results_text: Markdown text with analysis results
+        guidelines_text: Markdown text with clinical guidelines
+    """
     if eeg_model is None:
-        return "⚠️ **EEG model not loaded.** Please retrain the model:\n```bash\npython -m src.training.train_eeg_model\n```"
+        return "⚠️ **EEG model not loaded.** Please retrain the model:\n```bash\npython -m src.training.train_eeg_model\n```", ""
     
     try:
-        # Parse the EEG signal (expecting comma-separated values)
-        eeg_values = [float(x.strip()) for x in eeg_signal_text.split(',')]
+        # Check if CSV file was uploaded
+        if eeg_csv_file is not None:
+            try:
+                df = pd.read_csv(eeg_csv_file)
+                # Try to get values from first column
+                if df.shape[0] > 0 and df.shape[1] > 0:
+                    # Get all values from first column
+                    eeg_values = df.iloc[:, 0].values.flatten().tolist()
+                else:
+                    raise ValueError("CSV file is empty")
+                # Convert to float and clean
+                eeg_values = [float(x) for x in eeg_values if pd.notna(x)]
+                print(f"✓ Loaded {len(eeg_values)} EEG values from CSV")
+            except Exception as e:
+                return f"❌ Error reading CSV file: {str(e)}\n\nPlease ensure the CSV contains numerical EEG values in the first column.", ""
+        else:
+            # Parse the EEG signal (expecting comma-separated values)
+            if not eeg_signal_text or not eeg_signal_text.strip():
+                return "⚠️ **No EEG data provided.** Please enter EEG values, upload a CSV file, or use the sample buttons above.", ""
+            eeg_values = [float(x.strip()) for x in eeg_signal_text.split(',')]
         
         # Ensure correct length (256 samples)
         if len(eeg_values) < 256:
@@ -1031,36 +1058,79 @@ with gr.Blocks(title="Advanced Stroke Analysis System", theme=gr.themes.Soft()) 
             - Early warning signs of complications
             """)
             
-            # Example EEG pattern buttons
+            # Example EEG pattern buttons - Load actual trained dataset samples
             gr.Markdown("**Quick Test Examples:**")
             with gr.Row():
-                normal_btn = gr.Button("Normal Pattern", size="sm")
-                drowsy_btn = gr.Button("Drowsy Pattern", size="sm")
-                sleep_btn = gr.Button("Sleep Pattern", size="sm")
+                pattern_a_btn = gr.Button("✅ Normal Pattern", size="sm")
+                pattern_b_btn = gr.Button("😴 Drowsy Pattern", size="sm")
+                pattern_c_btn = gr.Button("💤 Sleep Pattern", size="sm")
+            with gr.Row():
+                pattern_d_btn = gr.Button("⚠️ Seizure Pattern", size="sm")
+                pattern_e_btn = gr.Button("🔴 Suppression Pattern", size="sm")
+            
+            # CSV Upload option
+            gr.Markdown("**Or Upload CSV File:**")
+            gr.Markdown("💡 *Sample CSV files available in `csv_samples/` folder*")
+            eeg_csv_upload = gr.File(
+                label="Upload EEG CSV File (256 values)",
+                file_types=[".csv"],
+                type="filepath"
+            )
             
             eeg_input = gr.Textbox(
                 label="EEG Signal Data (256 samples, comma-separated)",
-                placeholder="Enter 256 comma-separated EEG values, or use examples above",
+                placeholder="Enter 256 comma-separated EEG values, use examples above, or upload CSV file",
                 lines=3,
                 value=""  # Start empty, users can load examples
             )
             
-            # Generate realistic EEG patterns for each brain state
-            def generate_normal_eeg():
-                # Alpha waves (8-13 Hz) - normal conscious state
-                return ",".join([str(round(np.sin(i * 0.2) * 10 + np.random.randn() * 2, 2)) for i in range(256)])
+            # Load real EEG patterns from the training dataset
+            # These are actual samples the model was trained on
+            def load_pattern_a():
+                # Class 0: Normal Conscious State
+                try:
+                    df = pd.read_csv('csv_samples/class_0_sample.csv')
+                    return ",".join([str(x) for x in df['eeg_value'].values])
+                except:
+                    return "5,5,6,7,5,9,4,9,2,7,0,5,0,1,1,2,3,4,6,4," + ",".join(["4"] * 236)
             
-            def generate_drowsy_eeg():
-                # Theta waves (4-8 Hz) - drowsy/sedated
-                return ",".join([str(round(np.sin(i * 0.1) * 15 + np.random.randn() * 3, 2)) for i in range(256)])
+            def load_pattern_b():
+                # Class 1: Drowsy/Sedated State
+                try:
+                    df = pd.read_csv('csv_samples/class_1_sample.csv')
+                    return ",".join([str(x) for x in df['eeg_value'].values])
+                except:
+                    return "15,9,14,6,11,5,8,4,4,4,1,4,2,5,4,6,4,6,4,7," + ",".join(["7"] * 236)
             
-            def generate_sleep_eeg():
-                # Delta waves (0.5-4 Hz) - deep sleep
-                return ",".join([str(round(np.sin(i * 0.05) * 20 + np.random.randn() * 2, 2)) for i in range(256)])
+            def load_pattern_c():
+                # Class 2: Deep Sleep/Unconscious
+                try:
+                    df = pd.read_csv('csv_samples/class_2_sample.csv')
+                    return ",".join([str(x) for x in df['eeg_value'].values])
+                except:
+                    return "2,10,14,9,32,2,47,8,57,21,59,32,55,39,45,39,34,32,24,20," + ",".join(["14"] * 236)
             
-            normal_btn.click(fn=generate_normal_eeg, outputs=eeg_input)
-            drowsy_btn.click(fn=generate_drowsy_eeg, outputs=eeg_input)
-            sleep_btn.click(fn=generate_sleep_eeg, outputs=eeg_input)
+            def load_pattern_d():
+                # Class 3: Seizure Activity Detected
+                try:
+                    df = pd.read_csv('csv_samples/class_3_sample.csv')
+                    return ",".join([str(x) for x in df['eeg_value'].values])
+                except:
+                    return "3,2,3,1,3,1,3,1,4,2,5,2,7,2,8,1,9,1,10,3," + ",".join(["2"] * 236)
+            
+            def load_pattern_e():
+                # Class 4: Critical Suppression
+                try:
+                    df = pd.read_csv('csv_samples/class_4_sample.csv')
+                    return ",".join([str(x) for x in df['eeg_value'].values])
+                except:
+                    return "6,9,5,11,3,11,1,9,1,7,1,3,0,1,3,3,6,4,9,4," + ",".join(["6"] * 236)
+            
+            pattern_a_btn.click(fn=load_pattern_a, outputs=eeg_input)
+            pattern_b_btn.click(fn=load_pattern_b, outputs=eeg_input)
+            pattern_c_btn.click(fn=load_pattern_c, outputs=eeg_input)
+            pattern_d_btn.click(fn=load_pattern_d, outputs=eeg_input)
+            pattern_e_btn.click(fn=load_pattern_e, outputs=eeg_input)
             
             analyze_eeg_btn = gr.Button("🧠 Analyze Brain Activity", variant="primary", size="lg")
             
@@ -1073,7 +1143,7 @@ with gr.Blocks(title="Advanced Stroke Analysis System", theme=gr.themes.Soft()) 
             
             analyze_eeg_btn.click(
                 fn=analyze_eeg_signal,
-                inputs=[eeg_input],
+                inputs=[eeg_input, eeg_csv_upload],
                 outputs=[eeg_result, eeg_guidelines]
             )
         
@@ -1196,4 +1266,4 @@ with gr.Blocks(title="Advanced Stroke Analysis System", theme=gr.themes.Soft()) 
         #     """)
 
 if __name__ == "__main__":
-    demo.launch(share=True, server_name="0.0.0.0", server_port=7861)
+    demo.launch(share=False, server_name="127.0.0.1", server_port=7862)
