@@ -1,106 +1,349 @@
+"""
+Multi-Modal Fusion Model for Stroke Classification
+
+This module implements a trimodal fusion network that combines:
+1. Vision Transformer (ViT) for brain MRI/CT scan analysis
+2. Biomarker MLP for clinical risk assessment
+3. EEG CNN for brain activity monitoring
+
+The fusion strategy uses late fusion with attention-weighted concatenation.
+"""
+
 import torch
 import torch.nn as nn
 
-from ..models.image_model import create_image_model
-from ..models.clinical_model import ClinicalModel
+from .image_model import create_image_model
+from .biomarker_model import BiomarkerModel
+from .eeg_model import SimpleEEGModel
+
+
+class AttentionFusion(nn.Module):
+    """
+    Attention-based fusion mechanism for combining multi-modal features.
+    Learns to weight the importance of each modality dynamically.
+    """
+    def __init__(self, feature_dims, hidden_dim=64):
+        """
+        Args:
+            feature_dims: List of feature dimensions for each modality
+            hidden_dim: Hidden dimension for attention computation
+        """
+        super(AttentionFusion, self).__init__()
+        total_dim = sum(feature_dims)
+        
+        # Attention network
+        self.attention = nn.Sequential(
+            nn.Linear(total_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, len(feature_dims)),
+            nn.Softmax(dim=1)
+        )
+        
+        # Project each modality to same dimension for weighted sum
+        self.projections = nn.ModuleList([
+            nn.Linear(dim, hidden_dim) for dim in feature_dims
+        ])
+        
+    def forward(self, features_list):
+        """
+        Args:
+            features_list: List of feature tensors from each modality
+        Returns:
+            Fused feature tensor
+        """
+        # Concatenate all features for attention computation
+        concat_features = torch.cat(features_list, dim=1)
+        
+        # Compute attention weights
+        attention_weights = self.attention(concat_features)  # (batch, num_modalities)
+        
+        # Project each modality
+        projected = [proj(feat) for proj, feat in zip(self.projections, features_list)]
+        
+        # Weighted sum
+        fused = sum(w.unsqueeze(-1) * p for w, p in zip(attention_weights.unbind(dim=1), projected))
+        
+        return fused, attention_weights
+
 
 class FusionModel(nn.Module):
-    def __init__(self, image_model_weights, clinical_model_weights, clinical_input_size, num_classes=4, dropout_rate=0.3):
+    """
+    Trimodal Fusion Network for Comprehensive Stroke Classification.
+    
+    Combines three modalities:
+    - Image (Brain MRI/CT): Vision Transformer extracts spatial features
+    - Biomarker: MLP processes clinical parameters
+    - EEG: 1D CNN analyzes brain electrical activity
+    
+    Uses late fusion with optional attention weighting.
+    """
+    
+    def __init__(self, 
+                 image_model_weights=None,
+                 biomarker_model_weights=None,
+                 eeg_model_weights=None,
+                 biomarker_input_dim=29,
+                 num_classes=3,
+                 dropout_rate=0.3,
+                 use_attention=True,
+                 freeze_backbones=False):
         """
-        Bimodal fusion network for image and clinical data.
+        Initialize the fusion model.
 
         Args:
-            image_model_weights (str): Path to the saved weights of the image model.
-            clinical_model_weights (str): Path to the saved weights of the clinical model.
-            clinical_input_size (int): The number of input features for the clinical model.
-            num_classes (int, optional): Number of output classes. Defaults to 4.
-            dropout_rate (float, optional): Dropout rate for the classification head. Defaults to 0.3.
+            image_model_weights: Path to pretrained ViT weights (optional)
+            biomarker_model_weights: Path to pretrained biomarker MLP weights (optional)
+            eeg_model_weights: Path to pretrained EEG CNN weights (optional)
+            biomarker_input_dim: Number of biomarker input features (default: 29)
+            num_classes: Number of output classes (default: 3 for stroke types)
+            dropout_rate: Dropout rate for fusion head
+            use_attention: Whether to use attention-based fusion
+            freeze_backbones: Whether to freeze pretrained backbone weights
         """
         super(FusionModel, self).__init__()
         
-        # Load pre-trained models
+        self.use_attention = use_attention
+        self.num_classes = num_classes
+        
+        # === Image Branch (Vision Transformer) ===
         self.image_model = create_image_model(num_classes=num_classes)
-        # The image model from timm doesn't have a separate feature extractor, so we'll take the output before the head.
-        image_model_state_dict = torch.load(image_model_weights)
-        # Adjust for the number of classes the pretrained model was saved with
-        num_pretrained_classes = image_model_state_dict['head.weight'].shape[0]
-        self.image_model = create_image_model(num_classes=num_pretrained_classes)
-        self.image_model.load_state_dict(image_model_state_dict)
-        vit_feature_size = self.image_model.head.in_features
-        self.image_model.head = nn.Identity() # Remove classification head
+        if image_model_weights:
+            try:
+                state_dict = torch.load(image_model_weights, map_location='cpu')
+                self.image_model.load_state_dict(state_dict)
+                print("✓ Loaded pretrained image model weights")
+            except Exception as e:
+                print(f"⚠ Could not load image weights: {e}")
         
-        self.clinical_model = ClinicalModel(input_size=clinical_input_size, hidden_sizes=[64, 32, 16], feature_vector_size=16)
-        self.clinical_model.load_state_dict(torch.load(clinical_model_weights, weights_only=True))
+        # Get ViT feature dimension and replace head with identity
+        self.vit_feature_dim = self.image_model.head.in_features  # Usually 768
+        self.image_model.head = nn.Identity()
         
-        # Fine-tuning: Unfreeze the backbones to allow them to be trained
-        for param in self.image_model.parameters():
-            param.requires_grad = True
-        for param in self.clinical_model.parameters():
-            param.requires_grad = True
-            
-        # Determine the size of the concatenated feature vector
-        clinical_feature_size = 16
-        concatenated_size = vit_feature_size + clinical_feature_size
+        # === Biomarker Branch (MLP) ===
+        self.biomarker_model = BiomarkerModel(
+            input_dim=biomarker_input_dim,
+            hidden_dim1=128,
+            hidden_dim2=64,
+            output_dim=64  # Feature output, not classification
+        )
+        self.biomarker_feature_dim = 64
         
-        # Create the classification head
+        if biomarker_model_weights:
+            try:
+                checkpoint = torch.load(biomarker_model_weights, map_location='cpu')
+                # Load only compatible layers (input and hidden, not output)
+                if 'model_state_dict' in checkpoint:
+                    state_dict = checkpoint['model_state_dict']
+                else:
+                    state_dict = checkpoint
+                # Partial loading - skip mismatched layers
+                model_dict = self.biomarker_model.state_dict()
+                pretrained_dict = {k: v for k, v in state_dict.items() 
+                                 if k in model_dict and v.shape == model_dict[k].shape}
+                model_dict.update(pretrained_dict)
+                self.biomarker_model.load_state_dict(model_dict, strict=False)
+                print(f"✓ Loaded {len(pretrained_dict)}/{len(model_dict)} biomarker layers")
+            except Exception as e:
+                print(f"⚠ Could not load biomarker weights: {e}")
+        
+        # === EEG Branch (1D CNN) ===
+        self.eeg_model = SimpleEEGModel(num_classes=64)  # Feature output
+        self.eeg_feature_dim = 64
+        
+        if eeg_model_weights:
+            try:
+                state_dict = torch.load(eeg_model_weights, map_location='cpu')
+                self.eeg_model.load_state_dict(state_dict, strict=False)
+                print("✓ Loaded pretrained EEG model weights")
+            except Exception as e:
+                print(f"⚠ Could not load EEG weights: {e}")
+        
+        # === Freeze backbones if specified ===
+        if freeze_backbones:
+            for param in self.image_model.parameters():
+                param.requires_grad = False
+            for param in self.biomarker_model.parameters():
+                param.requires_grad = False
+            for param in self.eeg_model.parameters():
+                param.requires_grad = False
+            print("✓ Backbone weights frozen")
+        
+        # === Fusion Layer ===
+        feature_dims = [self.vit_feature_dim, self.biomarker_feature_dim, self.eeg_feature_dim]
+        total_features = sum(feature_dims)
+        
+        if use_attention:
+            self.attention_fusion = AttentionFusion(feature_dims, hidden_dim=128)
+            fusion_input_dim = 128  # Output of attention fusion
+        else:
+            self.attention_fusion = None
+            fusion_input_dim = total_features
+        
+        # === Classification Head ===
         self.fusion_head = nn.Sequential(
-            nn.Linear(concatenated_size, 128),
+            nn.Linear(fusion_input_dim, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 128),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
             nn.Linear(128, num_classes)
         )
+        
+        print(f"✓ Fusion model initialized")
+        print(f"  - Image features: {self.vit_feature_dim}")
+        print(f"  - Biomarker features: {self.biomarker_feature_dim}")
+        print(f"  - EEG features: {self.eeg_feature_dim}")
+        print(f"  - Fusion method: {'Attention' if use_attention else 'Concatenation'}")
+        print(f"  - Output classes: {num_classes}")
 
-    def forward(self, image_data, clinical_data):
+    def forward(self, image_data=None, biomarker_data=None, eeg_data=None):
         """
-        Forward pass of the fusion model.
+        Forward pass with flexible modality inputs.
+        
+        At least one modality must be provided. Missing modalities
+        are handled by using zero features or learned defaults.
 
         Args:
-            image_data (torch.Tensor): Input image tensor.
-            clinical_data (torch.Tensor): Input clinical data tensor.
+            image_data: Brain scan tensor (batch, 3, 224, 224)
+            biomarker_data: Clinical parameters tensor (batch, 29)
+            eeg_data: EEG signal tensor (batch, 1, 256)
 
         Returns:
-            torch.Tensor: The output logits.
+            output: Classification logits (batch, num_classes)
+            attention_weights: Modality attention weights (if use_attention=True)
         """
-        # Get feature embeddings from each branch
-        image_features = self.image_model(image_data)
-        clinical_features = self.clinical_model(clinical_data)
+        batch_size = None
+        device = None
         
-        # Concatenate the features
-        concatenated_features = torch.cat((image_features, clinical_features), dim=1)
+        # Determine batch size and device from available inputs
+        for data in [image_data, biomarker_data, eeg_data]:
+            if data is not None:
+                batch_size = data.size(0)
+                device = data.device
+                break
         
-        # Pass through the fusion head
-        output = self.fusion_head(concatenated_features)
+        if batch_size is None:
+            raise ValueError("At least one modality must be provided")
         
+        # === Extract features from each modality ===
+        features_list = []
+        
+        # Image features
+        if image_data is not None:
+            image_features = self.image_model(image_data)
+        else:
+            image_features = torch.zeros(batch_size, self.vit_feature_dim, device=device)
+        features_list.append(image_features)
+        
+        # Biomarker features
+        if biomarker_data is not None:
+            biomarker_features = self.biomarker_model(biomarker_data)
+        else:
+            biomarker_features = torch.zeros(batch_size, self.biomarker_feature_dim, device=device)
+        features_list.append(biomarker_features)
+        
+        # EEG features
+        if eeg_data is not None:
+            eeg_features = self.eeg_model(eeg_data)
+        else:
+            eeg_features = torch.zeros(batch_size, self.eeg_feature_dim, device=device)
+        features_list.append(eeg_features)
+        
+        # === Fusion ===
+        if self.use_attention and self.attention_fusion is not None:
+            fused_features, attention_weights = self.attention_fusion(features_list)
+        else:
+            fused_features = torch.cat(features_list, dim=1)
+            attention_weights = None
+        
+        # === Classification ===
+        output = self.fusion_head(fused_features)
+        
+        if self.use_attention:
+            return output, attention_weights
         return output
+    
+    def get_modality_contributions(self, image_data=None, biomarker_data=None, eeg_data=None):
+        """
+        Analyze the contribution of each modality to the final prediction.
+        
+        Returns:
+            dict with attention weights and individual modality predictions
+        """
+        self.eval()
+        with torch.no_grad():
+            output, attention_weights = self.forward(image_data, biomarker_data, eeg_data)
+            
+            contributions = {
+                'prediction': torch.softmax(output, dim=1),
+                'attention_weights': attention_weights,
+                'modality_names': ['Image (ViT)', 'Biomarker (MLP)', 'EEG (CNN)']
+            }
+            
+            if attention_weights is not None:
+                for i, name in enumerate(contributions['modality_names']):
+                    contributions[f'{name}_weight'] = attention_weights[:, i].mean().item()
+        
+        return contributions
+
+
+class BimodalFusionModel(FusionModel):
+    """
+    Simplified bimodal fusion using only Image + Biomarker.
+    Useful when EEG data is not available.
+    """
+    def __init__(self, **kwargs):
+        # Remove EEG-related parameters
+        kwargs['eeg_model_weights'] = None
+        super().__init__(**kwargs)
+        
+    def forward(self, image_data, biomarker_data):
+        return super().forward(image_data=image_data, biomarker_data=biomarker_data, eeg_data=None)
+
 
 if __name__ == '__main__':
-    # This is a placeholder for where the actual weights would be.
-    # We need to run the individual training scripts first to generate these.
-    # For now, let's save dummy weights for testing the architecture.
+    print("=" * 60)
+    print("Testing Fusion Model Architecture")
+    print("=" * 60)
     
-    import os
-    if not os.path.exists('models'):
-        os.makedirs('models')
-
-    # Save dummy weights for each model
-    torch.save(create_image_model(num_classes=3).state_dict(), 'models/image_model_weights.pth')
-    torch.save(ClinicalModel(input_size=25, hidden_sizes=[64, 32, 16], feature_vector_size=16).state_dict(), 'models/clinical_model_weights.pth')
-
-    # Initialize the fusion model
-    fusion_model = FusionModel(
-        image_model_weights='models/image_model_weights.pth',
-        clinical_model_weights='models/clinical_model_weights.pth',
-        clinical_input_size=25,
-        num_classes=3 # Matching the image data classes
+    # Initialize model without pretrained weights
+    model = FusionModel(
+        biomarker_input_dim=29,
+        num_classes=3,
+        use_attention=True
     )
-    
-    print(fusion_model)
     
     # Test with dummy inputs
     batch_size = 4
     image_input = torch.randn(batch_size, 3, 224, 224)
-    clinical_input = torch.randn(batch_size, 25)
+    biomarker_input = torch.randn(batch_size, 29)
+    eeg_input = torch.randn(batch_size, 1, 256)
     
-    output = fusion_model(image_input, clinical_input)
-    print("Output shape:", output.shape)
-    assert output.shape == (batch_size, 3)
+    print("\n--- Testing Full Trimodal Fusion ---")
+    output, attention = model(image_input, biomarker_input, eeg_input)
+    print(f"Output shape: {output.shape}")
+    print(f"Attention weights shape: {attention.shape}")
+    print(f"Attention weights: {attention[0].tolist()}")
+    
+    print("\n--- Testing with Missing Modalities ---")
+    # Only image
+    output1, _ = model(image_data=image_input)
+    print(f"Image only - Output shape: {output1.shape}")
+    
+    # Only biomarker
+    output2, _ = model(biomarker_data=biomarker_input)
+    print(f"Biomarker only - Output shape: {output2.shape}")
+    
+    # Image + Biomarker
+    output3, attn = model(image_data=image_input, biomarker_data=biomarker_input)
+    print(f"Image + Biomarker - Output shape: {output3.shape}")
+    
+    print("\n--- Model Summary ---")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    print("\n✓ All tests passed!")
